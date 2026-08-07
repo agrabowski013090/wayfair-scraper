@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Scraper runtime output (generated, not source)
+ebike_escooter_report.csv
+ebike_escooter_checkpoint.json
+ebike_escooter_checkpoint.tmp
+debug_html/
