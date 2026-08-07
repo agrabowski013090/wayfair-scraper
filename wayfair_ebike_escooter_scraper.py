@@ -47,6 +47,7 @@ blip) resumes automatically from the checkpoint file.
 import argparse
 import csv
 import json
+import os
 import random
 import re
 import sys
@@ -58,6 +59,7 @@ from typing import Optional
 from urllib.parse import quote, urljoin
 
 from playwright.sync_api import (
+    Error as PWError,
     Page,
     TimeoutError as PWTimeoutError,
     sync_playwright,
@@ -205,11 +207,42 @@ def goto_with_retry(page: Page, url: str, limiter: RateLimiter, retries: int = 3
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             limiter.note_success()
             return True
-        except PWTimeoutError:
+        except (PWTimeoutError, PWError) as e:
+            # Catch any navigation failure (timeout, DNS, refused/blocked
+            # connection, proxy denial) so a single bad URL logs cleanly and
+            # backs off instead of crashing the whole crawl with a traceback.
             limiter.note_failure()
             if attempt == retries:
+                print(
+                    f"[nav-fail] {url}: {str(e).splitlines()[0]}",
+                    file=sys.stderr,
+                )
                 return False
     return False
+
+
+def launch_browser(p, args):
+    """Launch Chromium, falling back to a pre-provisioned browser binary when
+    the Playwright-managed download is unavailable (common in sandboxes where
+    the browser CDN is blocked but a Chromium is already on disk)."""
+    launch_kwargs = {"headless": args.headless}
+    if args.executable_path:
+        launch_kwargs["executable_path"] = args.executable_path
+    try:
+        return p.chromium.launch(**launch_kwargs)
+    except PWError as e:
+        if args.executable_path or "Executable doesn't exist" not in str(e):
+            raise
+        browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+        candidate = Path(browsers_root) / "chromium" if browsers_root else None
+        if candidate and candidate.exists():
+            print(
+                f"[browser] managed Chromium not found; using pre-installed "
+                f"binary at {candidate}"
+            )
+            launch_kwargs["executable_path"] = str(candidate)
+            return p.chromium.launch(**launch_kwargs)
+        raise
 
 
 def extract_product_links(page: Page) -> list:
@@ -337,7 +370,7 @@ def crawl(args):
         csv_file.flush()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
+        browser = launch_browser(p, args)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
 
@@ -430,9 +463,18 @@ def parse_args():
     ap.add_argument("--min-delay", type=float, default=2.5, help="Minimum delay in seconds between navigations")
     ap.add_argument("--max-delay", type=float, default=5.0, help="Maximum delay in seconds between navigations")
     ap.add_argument("--max-pages", type=int, default=None, help="Max listing pages per keyword (testing)")
-    ap.add_argument("--headless", action="store_true", help="Run Chromium in headless mode")
+    ap.add_argument("--headless", action="store_true", default=True,
+                    help="Run Chromium headless (default; safe on servers with no display)")
+    ap.add_argument("--headed", action="store_true",
+                    help="Run Chromium with a visible window (overrides the headless default)")
+    ap.add_argument("--executable-path", default=None,
+                    help="Path to a Chromium binary to use instead of the Playwright-managed "
+                         "one (e.g. /opt/pw-browsers/chromium in sandboxes)")
     ap.add_argument("--debug-dir", default=None, help="Dump HTML for products missing name/sku")
-    return ap.parse_args()
+    args = ap.parse_args()
+    # Headless by default; --headed opts into a visible window.
+    args.headless = not args.headed
+    return args
 
 
 if __name__ == "__main__":
